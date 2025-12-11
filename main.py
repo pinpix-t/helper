@@ -191,8 +191,7 @@ async def send_freshchat_reply(conversation_id: str, message: str) -> bool:
                 }
             }
         ],
-        "actor_type": "agent",
-        "actor_id": "design-assistant-bot"
+        "actor_type": "system"
     }
 
     try:
