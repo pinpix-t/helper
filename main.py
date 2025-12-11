@@ -2,7 +2,7 @@
 Design Assistant Bot - FastAPI Backend
 
 A webhook-based service for Printerpix's design editor pages.
-Receives messages from Freshchat, detects intent, and replies via Freshchat API.
+Receives messages from Freshchat, detects intent using DeepSeek LLM, and replies via Freshchat API.
 """
 
 import logging
@@ -14,9 +14,10 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from intents import INTENTS, UNKNOWN_REPLY, IntentDefinition
+from intents import INTENTS, UNKNOWN_REPLY
 
 
 # --- Load Environment Variables ---
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 FRESHCHAT_API_URL = os.getenv("FRESHCHAT_API_URL", "")
 FRESHCHAT_API_KEY = os.getenv("FRESHCHAT_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 MAX_CONTEXT_MESSAGES = 5
 
 # Log config status on startup
@@ -45,18 +47,38 @@ if FRESHCHAT_API_URL and FRESHCHAT_API_KEY:
 else:
     logger.warning("Freshchat API not configured - replies will not be sent")
 
+if DEEPSEEK_API_KEY:
+    logger.info("DeepSeek API configured")
+else:
+    logger.warning("DeepSeek API not configured - falling back to keyword matching")
+
+# DeepSeek client (OpenAI-compatible)
+deepseek_client = None
+if DEEPSEEK_API_KEY:
+    deepseek_client = OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com"
+    )
+
+
+# --- Build intent info for the prompt ---
+
+INTENT_DESCRIPTIONS = "\n".join([
+    f"- {intent.name}: {intent.keywords[0]}, {intent.keywords[1] if len(intent.keywords) > 1 else ''}"
+    for intent in INTENTS
+])
+
+INTENT_NAMES = [intent.name for intent in INTENTS]
+
 
 # --- Conversation Memory ---
 
-# In-memory store: {conversation_id: [list of messages]}
-# Each message is {"role": "user"|"assistant", "content": "..."}
 conversations: dict[str, list[dict[str, str]]] = defaultdict(list)
 
 
 def add_to_conversation(conversation_id: str, role: str, content: str) -> None:
     """Add a message to conversation history, keeping only last N messages."""
     conversations[conversation_id].append({"role": role, "content": content})
-    # Keep only the last MAX_CONTEXT_MESSAGES
     if len(conversations[conversation_id]) > MAX_CONTEXT_MESSAGES:
         conversations[conversation_id] = conversations[conversation_id][-MAX_CONTEXT_MESSAGES:]
 
@@ -74,7 +96,6 @@ class WebhookRequest(BaseModel):
 
     conversation_id: str = Field(..., description="Unique conversation identifier")
     message: str = Field(..., description="User's message")
-    # Optional fields that Freshchat might send
     user_id: str | None = Field(default=None, description="User identifier")
     timestamp: str | None = Field(default=None, description="Message timestamp")
     metadata: dict[str, Any] | None = Field(default=None, description="Additional metadata")
@@ -89,73 +110,102 @@ class WebhookResponse(BaseModel):
     reply_sent: bool = Field(..., description="Whether reply was sent to Freshchat")
 
 
-# --- Intent Detection Logic ---
+# --- Intent Detection with DeepSeek ---
 
 
-def detect_intent(message: str) -> tuple[IntentDefinition | None, int]:
+def detect_intent_with_llm(message: str) -> tuple[str, float]:
     """
-    Detect the best matching intent for a given message.
-
-    Args:
-        message: The user's message (will be normalized to lowercase)
-
+    Use DeepSeek to classify the user's message into an intent.
+    
     Returns:
-        Tuple of (matched IntentDefinition or None, number of keyword hits)
+        Tuple of (intent_name, confidence)
+    """
+    if not deepseek_client:
+        # Fallback to keyword matching if no API key
+        return detect_intent_keywords(message)
+    
+    try:
+        prompt = f"""You are a customer support intent classifier for Printerpix, a photo printing company.
+
+Classify the following customer message into ONE of these intents:
+- CALENDAR_START_MONTH: Questions about choosing or changing the starting month of a calendar
+- CHANGE_BOOK_TYPE_OR_SIZE: Questions about changing photo book type, size, or format after starting a project
+- ORDER_PREVIEW: Questions about previewing how an order will look before purchasing
+- UPLOAD_CHRONOLOGICAL: Questions about uploading photos in date/chronological order
+- UPLOAD_ERROR_GENERAL: Problems with uploading photos, errors, stuck uploads, loading issues
+- UNKNOWN: If the message doesn't fit any of the above categories
+
+Customer message: "{message}"
+
+Respond with ONLY the intent name, nothing else. For example: ORDER_PREVIEW"""
+
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=50,
+            temperature=0.1,
+        )
+        
+        intent = response.choices[0].message.content.strip().upper()
+        
+        # Validate the intent
+        if intent in INTENT_NAMES:
+            logger.info(f"DeepSeek classified as: {intent}")
+            return intent, 0.9
+        elif intent == "UNKNOWN":
+            logger.info("DeepSeek classified as: UNKNOWN")
+            return "UNKNOWN", 0.0
+        else:
+            # If LLM returns something unexpected, treat as unknown
+            logger.warning(f"DeepSeek returned unexpected intent: {intent}")
+            return "UNKNOWN", 0.0
+            
+    except Exception as e:
+        logger.error(f"DeepSeek API error: {e}")
+        # Fallback to keyword matching on error
+        return detect_intent_keywords(message)
+
+
+def detect_intent_keywords(message: str) -> tuple[str, float]:
+    """
+    Fallback: keyword-based intent detection.
     """
     normalized = message.lower()
-
-    best_intent: IntentDefinition | None = None
+    
+    best_intent = None
     best_hits = 0
-
+    
     for intent in INTENTS:
         hits = sum(1 for keyword in intent.keywords if keyword in normalized)
         if hits > best_hits:
             best_hits = hits
             best_intent = intent
+    
+    if best_intent:
+        confidence = 0.9 if best_hits > 1 else 0.7
+        return best_intent.name, confidence
+    
+    return "UNKNOWN", 0.0
 
-    return best_intent, best_hits
 
-
-def calculate_confidence(hits: int) -> float:
-    """
-    Calculate confidence score based on number of keyword hits.
-
-    Args:
-        hits: Number of keywords matched
-
-    Returns:
-        Confidence score (0.9 if >1 hit, 0.7 if 1 hit, 0.0 if none)
-    """
-    if hits > 1:
-        return 0.9
-    elif hits == 1:
-        return 0.7
-    else:
-        return 0.0
+def get_reply_for_intent(intent_name: str) -> str:
+    """Get the reply template for a given intent."""
+    for intent in INTENTS:
+        if intent.name == intent_name:
+            reply = intent.reply
+            if intent.suggested_followup:
+                reply += f"\n\n{intent.suggested_followup}"
+            return reply
+    return UNKNOWN_REPLY
 
 
 def generate_reply(message: str, conversation_id: str) -> tuple[str, str, float]:
     """
-    Generate a reply for the user's message.
-
-    Args:
-        message: The user's message
-        conversation_id: The conversation ID for context
-
-    Returns:
-        Tuple of (reply text, intent name, confidence)
+    Generate a reply for the user's message using DeepSeek for classification.
     """
-    intent, hits = detect_intent(message)
-    confidence = calculate_confidence(hits)
-
-    if intent is None:
-        return UNKNOWN_REPLY, "UNKNOWN", 0.0
-
-    reply = intent.reply
-    if intent.suggested_followup:
-        reply += f"\n\n{intent.suggested_followup}"
-
-    return reply, intent.name, confidence
+    intent_name, confidence = detect_intent_with_llm(message)
+    reply = get_reply_for_intent(intent_name)
+    return reply, intent_name, confidence
 
 
 # --- Freshchat API Client ---
@@ -164,22 +214,11 @@ def generate_reply(message: str, conversation_id: str) -> tuple[str, str, float]
 async def send_freshchat_reply(conversation_id: str, message: str) -> bool:
     """
     Send a reply to Freshchat via their API.
-
-    Freshchat API endpoint: POST /v2/conversations/{conversation_id}/messages
-    
-    Args:
-        conversation_id: The Freshchat conversation ID
-        message: The message to send
-
-    Returns:
-        True if successful, False otherwise
     """
     if not FRESHCHAT_API_URL or not FRESHCHAT_API_KEY:
         logger.warning("Freshchat API not configured - reply not sent")
         return False
 
-    # Build the full URL for sending messages
-    # FRESHCHAT_API_URL should be like: https://xxx.freshchat.com/v2
     url = f"{FRESHCHAT_API_URL}/conversations/{conversation_id}/messages"
 
     # Freshchat message format - replies as Hannah
@@ -222,11 +261,10 @@ async def send_freshchat_reply(conversation_id: str, message: str) -> bool:
 
 app = FastAPI(
     title="Design Assistant Bot",
-    description="Webhook-based intent detection for Printerpix design support",
-    version="2.0.0",
+    description="LLM-powered intent detection for Printerpix design support",
+    version="3.0.0",
 )
 
-# CORS - allow all origins for now
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -241,9 +279,10 @@ def root() -> dict[str, str]:
     """Root endpoint with API info."""
     return {
         "service": "Design Assistant Bot",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "endpoint": "POST /webhook",
         "health": "/health",
+        "llm": "DeepSeek" if deepseek_client else "keyword fallback",
     }
 
 
@@ -257,27 +296,16 @@ def health_check() -> dict[str, str]:
 async def webhook(request: WebhookRequest) -> WebhookResponse:
     """
     Process incoming message from Freshchat and send reply.
-
-    This endpoint:
-    1. Receives a message from Freshchat
-    2. Adds it to conversation history
-    3. Detects intent and generates reply
-    4. Sends reply back via Freshchat API
-    5. Logs the interaction
     """
     conversation_id = request.conversation_id
     message = request.message
 
-    # Add user message to conversation history
     add_to_conversation(conversation_id, "user", message)
 
-    # Generate reply
     reply, intent, confidence = generate_reply(message, conversation_id)
 
-    # Add assistant reply to conversation history
     add_to_conversation(conversation_id, "assistant", reply)
 
-    # Log the interaction
     logger.info(
         f"conversation_id={conversation_id} | "
         f"intent={intent} | "
@@ -285,7 +313,6 @@ async def webhook(request: WebhookRequest) -> WebhookResponse:
         f"message_preview={message[:50]}..."
     )
 
-    # Send reply to Freshchat
     reply_sent = await send_freshchat_reply(conversation_id, reply)
 
     return WebhookResponse(
@@ -298,15 +325,7 @@ async def webhook(request: WebhookRequest) -> WebhookResponse:
 
 @app.get("/conversations/{conversation_id}")
 def get_conversation(conversation_id: str) -> dict[str, Any]:
-    """
-    Get conversation history for debugging/monitoring.
-
-    Args:
-        conversation_id: The conversation ID to look up
-
-    Returns:
-        Conversation history and metadata
-    """
+    """Get conversation history for debugging/monitoring."""
     history = get_conversation_context(conversation_id)
     return {
         "conversation_id": conversation_id,
