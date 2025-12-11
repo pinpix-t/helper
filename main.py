@@ -1,8 +1,8 @@
 """
 Design Assistant Bot - FastAPI Backend
 
-A webhook-based service for Printerpix's design editor pages.
-Receives messages from Freshchat, detects intent using DeepSeek LLM, and replies via Freshchat API.
+A conversational chatbot for Printerpix's design editor pages.
+Uses DeepSeek LLM to generate helpful responses about the design process.
 """
 
 import logging
@@ -16,8 +16,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel, Field
-
-from intents import INTENTS, UNKNOWN_REPLY
 
 
 # --- Load Environment Variables ---
@@ -39,7 +37,7 @@ logger = logging.getLogger(__name__)
 FRESHCHAT_API_URL = os.getenv("FRESHCHAT_API_URL", "")
 FRESHCHAT_API_KEY = os.getenv("FRESHCHAT_API_KEY", "")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-MAX_CONTEXT_MESSAGES = 5
+MAX_CONTEXT_MESSAGES = 10
 
 # Log config status on startup
 if FRESHCHAT_API_URL and FRESHCHAT_API_KEY:
@@ -50,7 +48,7 @@ else:
 if DEEPSEEK_API_KEY:
     logger.info("DeepSeek API configured")
 else:
-    logger.warning("DeepSeek API not configured - falling back to keyword matching")
+    logger.warning("DeepSeek API not configured")
 
 # DeepSeek client (OpenAI-compatible)
 deepseek_client = None
@@ -61,14 +59,50 @@ if DEEPSEEK_API_KEY:
     )
 
 
-# --- Build intent info for the prompt ---
+# --- System Prompt with Printerpix Knowledge ---
 
-INTENT_DESCRIPTIONS = "\n".join([
-    f"- {intent.name}: {intent.keywords[0]}, {intent.keywords[1] if len(intent.keywords) > 1 else ''}"
-    for intent in INTENTS
-])
+SYSTEM_PROMPT = """You are Hannah, a friendly and helpful customer support assistant for Printerpix, a photo printing company. You help customers with questions about the online design editor for photo books, calendars, and other photo products.
 
-INTENT_NAMES = [intent.name for intent in INTENTS]
+## Your Personality
+- Friendly, warm, and professional
+- Concise but helpful - don't be overly wordy
+- Apologize sincerely when customers have issues
+- Always offer to help further at the end
+
+## Key Knowledge
+
+### Calendar Start Month
+Customers can choose any month as the starting month for their calendar. This option appears at the beginning of the design process, before editing starts. If they've already started a project with the wrong start month, they need to create a new project and select the correct month at the start.
+
+### Changing Book Type or Size
+It is NOT possible to change the book type or size once a project has been created. Each book type and size (leather cover, hardcover, 8x11, 11x14, etc.) has its own unique layout and formatting. To use a different option, customers must start a new project and redesign it.
+
+### Order Preview
+Customers can see exactly how their order will look by clicking the "Preview" option next to the "Add to Cart" button in the editor. The final product is printed exactly as shown in this preview, so they should check it carefully before ordering.
+
+### Photo Upload Order (Chronological)
+The Printerpix website does NOT currently support automatically uploading photos in chronological order. Each image must be added individually in the order the customer prefers. This can be time-consuming - acknowledge this and apologize for the inconvenience.
+
+### Upload Errors / Issues
+For upload problems (stuck uploads, errors, lag), recommend:
+1. Open an Incognito/Private window in Google Chrome
+2. Go to the Printerpix website, log in, and try uploading again
+3. Make sure images are in JPG format - PNG, GIF, and SVG are NOT accepted
+
+If the issue persists after these steps, ask for the specific error message to investigate further.
+
+## Response Guidelines
+- Keep responses concise (2-4 sentences when possible)
+- Be conversational, not robotic
+- If you don't know something specific about Printerpix, say so honestly and offer to connect them with a human agent
+- Don't make up features or capabilities that weren't mentioned above
+- For questions outside design/editor topics, politely explain you're specialized in design editor support
+
+## Example Response Style
+"You can preview your order by clicking 'Preview' next to the Add to Cart button - what you see there is exactly how it'll print! Let me know if you need help with anything else."
+
+NOT: "Hello valued customer, thank you for contacting Printerpix support. I would be delighted to assist you with your inquiry regarding the preview functionality..."
+"""
 
 
 # --- Conversation Memory ---
@@ -105,107 +139,47 @@ class WebhookResponse(BaseModel):
     """Response schema for the webhook endpoint."""
 
     success: bool = Field(..., description="Whether the message was processed successfully")
-    intent: str = Field(..., description="Detected intent name")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score")
+    reply: str = Field(..., description="The bot's response")
     reply_sent: bool = Field(..., description="Whether reply was sent to Freshchat")
 
 
-# --- Intent Detection with DeepSeek ---
+# --- Chat with DeepSeek ---
 
 
-def detect_intent_with_llm(message: str) -> tuple[str, float]:
+def generate_reply(message: str, conversation_id: str) -> str:
     """
-    Use DeepSeek to classify the user's message into an intent.
-    
-    Returns:
-        Tuple of (intent_name, confidence)
+    Generate a conversational reply using DeepSeek.
     """
     if not deepseek_client:
-        # Fallback to keyword matching if no API key
-        return detect_intent_keywords(message)
+        return "I'm sorry, I'm having trouble connecting right now. Please try again in a moment."
+    
+    # Build conversation history for context
+    history = get_conversation_context(conversation_id)
+    
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
+    # Add conversation history
+    for msg in history:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    
+    # Add current message
+    messages.append({"role": "user", "content": message})
     
     try:
-        prompt = f"""You are a customer support intent classifier for Printerpix, a photo printing company.
-
-Classify the following customer message into ONE of these intents:
-- CALENDAR_START_MONTH: Questions about choosing or changing the starting month of a calendar
-- CHANGE_BOOK_TYPE_OR_SIZE: Questions about changing photo book type, size, or format after starting a project
-- ORDER_PREVIEW: Questions about previewing how an order will look before purchasing
-- UPLOAD_CHRONOLOGICAL: Questions about uploading photos in date/chronological order
-- UPLOAD_ERROR_GENERAL: Problems with uploading photos, errors, stuck uploads, loading issues
-- UNKNOWN: If the message doesn't fit any of the above categories
-
-Customer message: "{message}"
-
-Respond with ONLY the intent name, nothing else. For example: ORDER_PREVIEW"""
-
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=50,
-            temperature=0.1,
+            messages=messages,
+            max_tokens=500,
+            temperature=0.7,
         )
         
-        intent = response.choices[0].message.content.strip().upper()
-        
-        # Validate the intent
-        if intent in INTENT_NAMES:
-            logger.info(f"DeepSeek classified as: {intent}")
-            return intent, 0.9
-        elif intent == "UNKNOWN":
-            logger.info("DeepSeek classified as: UNKNOWN")
-            return "UNKNOWN", 0.0
-        else:
-            # If LLM returns something unexpected, treat as unknown
-            logger.warning(f"DeepSeek returned unexpected intent: {intent}")
-            return "UNKNOWN", 0.0
+        reply = response.choices[0].message.content.strip()
+        logger.info(f"DeepSeek generated reply: {reply[:50]}...")
+        return reply
             
     except Exception as e:
         logger.error(f"DeepSeek API error: {e}")
-        # Fallback to keyword matching on error
-        return detect_intent_keywords(message)
-
-
-def detect_intent_keywords(message: str) -> tuple[str, float]:
-    """
-    Fallback: keyword-based intent detection.
-    """
-    normalized = message.lower()
-    
-    best_intent = None
-    best_hits = 0
-    
-    for intent in INTENTS:
-        hits = sum(1 for keyword in intent.keywords if keyword in normalized)
-        if hits > best_hits:
-            best_hits = hits
-            best_intent = intent
-    
-    if best_intent:
-        confidence = 0.9 if best_hits > 1 else 0.7
-        return best_intent.name, confidence
-    
-    return "UNKNOWN", 0.0
-
-
-def get_reply_for_intent(intent_name: str) -> str:
-    """Get the reply template for a given intent."""
-    for intent in INTENTS:
-        if intent.name == intent_name:
-            reply = intent.reply
-            if intent.suggested_followup:
-                reply += f"\n\n{intent.suggested_followup}"
-            return reply
-    return UNKNOWN_REPLY
-
-
-def generate_reply(message: str, conversation_id: str) -> tuple[str, str, float]:
-    """
-    Generate a reply for the user's message using DeepSeek for classification.
-    """
-    intent_name, confidence = detect_intent_with_llm(message)
-    reply = get_reply_for_intent(intent_name)
-    return reply, intent_name, confidence
+        return "I'm sorry, I'm having a bit of trouble right now. Could you try asking again?"
 
 
 # --- Freshchat API Client ---
@@ -261,8 +235,8 @@ async def send_freshchat_reply(conversation_id: str, message: str) -> bool:
 
 app = FastAPI(
     title="Design Assistant Bot",
-    description="LLM-powered intent detection for Printerpix design support",
-    version="3.0.0",
+    description="Conversational AI assistant for Printerpix design support",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -279,10 +253,10 @@ def root() -> dict[str, str]:
     """Root endpoint with API info."""
     return {
         "service": "Design Assistant Bot",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "endpoint": "POST /webhook",
         "health": "/health",
-        "llm": "DeepSeek" if deepseek_client else "keyword fallback",
+        "mode": "conversational" if deepseek_client else "offline",
     }
 
 
@@ -300,25 +274,27 @@ async def webhook(request: WebhookRequest) -> WebhookResponse:
     conversation_id = request.conversation_id
     message = request.message
 
+    # Add user message to conversation history
     add_to_conversation(conversation_id, "user", message)
 
-    reply, intent, confidence = generate_reply(message, conversation_id)
+    # Generate reply using DeepSeek
+    reply = generate_reply(message, conversation_id)
 
+    # Add assistant reply to conversation history
     add_to_conversation(conversation_id, "assistant", reply)
 
     logger.info(
         f"conversation_id={conversation_id} | "
-        f"intent={intent} | "
-        f"confidence={confidence:.2f} | "
-        f"message_preview={message[:50]}..."
+        f"message={message[:30]}... | "
+        f"reply={reply[:30]}..."
     )
 
+    # Send reply to Freshchat
     reply_sent = await send_freshchat_reply(conversation_id, reply)
 
     return WebhookResponse(
         success=True,
-        intent=intent,
-        confidence=confidence,
+        reply=reply,
         reply_sent=reply_sent,
     )
 
