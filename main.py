@@ -182,7 +182,7 @@ async def send_freshchat_reply(conversation_id: str, message: str) -> bool:
     # FRESHCHAT_API_URL should be like: https://xxx.freshchat.com/v2
     url = f"{FRESHCHAT_API_URL}/conversations/{conversation_id}/messages"
 
-    # Freshchat message format
+    # Freshchat message format - replies as Hannah
     payload = {
         "message_parts": [
             {
@@ -191,7 +191,8 @@ async def send_freshchat_reply(conversation_id: str, message: str) -> bool:
                 }
             }
         ],
-        "actor_type": "system"
+        "actor_type": "agent",
+        "actor_id": "c7813965-392f-45a4-a417-bebd90369a02"
     }
 
     try:
