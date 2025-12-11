@@ -140,7 +140,7 @@ Customer message: "{message}"
 Respond with ONLY the intent name, nothing else. For example: ORDER_PREVIEW"""
 
         response = deepseek_client.chat.completions.create(
-            model="deepseek-v3",
+            model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=50,
             temperature=0.1,
