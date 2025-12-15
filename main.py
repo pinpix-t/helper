@@ -121,29 +121,8 @@ Photos near the edge of pages may get slightly trimmed during production. Keep i
 ### Saving Projects
 Projects are automatically saved to your account as you work. You can find them in 'My Projects' when logged in. Make sure you're logged in before starting to avoid losing work.
 
-### Simple Editor Products (Limited Tools)
-These products use a simplified editor with only basic tools - customers can ONLY:
-- Zoom in/out on their photo
-- Adjust/position the photo within the frame
-- Replace the image with a different one
-
-**Products with simple editor:**
-- Canvas Print
-- Framed Canvas
-- Framed Print
-- Metal Print
-- Photo Tile
-- Aluminium Print
-- Poster
-- Board Puzzle
-- Photo Coaster
-- Mouse Pad
-- Premium Cushion
-- Photo Slate
-- Beach Towel
-- Magnet Print
-
-These products do NOT have text tools, filters, backgrounds, layouts, or advanced design options. If a customer asks about these features for the above products, let them know those aren't available for that product type.
+### Canvas Products (Simple Editor)
+For canvas products (Canvas Print, Framed Canvas, Framed Print, Metal Print, Photo Tile, Aluminium Print, Poster, Board Puzzle, Photo Coaster, Mouse Pad, Premium Cushion, Photo Slate, Beach Towel, Magnet Print), the editor only lets you zoom, adjust position, and replace the image. No text tools, filters, or layouts.
 
 ## Response Guidelines
 - Keep responses concise (2-4 sentences when possible)
